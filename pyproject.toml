@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vsat-pythonize"
+version = "0.2.0"
+description = "Modern Python velocity structure analysis tools for stellar catalogs"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = [
+    "numpy>=1.23",
+    "pandas>=1.5",
+    "matplotlib>=3.6",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.setuptools]
+py-modules = [
+    "calc_drdv_and_sort",
+    "correct_dv",
+    "main",
+    "parameters",
+    "plotting",
+    "read_data",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

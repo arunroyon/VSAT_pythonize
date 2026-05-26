@@ -1,75 +1,189 @@
-# Version 1.01, Becky Arnold, February 2018 running on python version 2.7.13
-import matplotlib.pyplot as plt
-import parameters
-import read_data
+"""Command-line and Python API entry points for VSAT."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from typing import Optional
+
+import numpy as np
+
 import calc_drdv_and_sort
 import correct_dv
-import plotting
-
-'''
-Set the parameters that will be needed to run the program.
-In this function the user should set the path_to_data variable
-to the path to the data file. They should also set error_flag to
-True if there are errors on the velocity data and False otherwise.
-'''
-path_to_data, error_flag, dv_default, correct_inflation, bin_width, dr_start, dr_end = parameters.set_parameters()
+import parameters
+import read_data
 
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+@dataclass(frozen=True)
+class VSATResult:
+    n_bins: int
+    edges: np.ndarray
+    mean_dv: np.ndarray
+    error: np.ndarray
+    n_in_bins: np.ndarray
+    count_stars_bins: np.ndarray
 
 
-'''
-Read in the data. The user must fill in this function in read_data.py.
-n_stars is the number of stars, r is the position data of the stars,
-v is the velocity data, and verr is the error on the velocity data.
-If there are no errors on the velocities verr should be 0.
-'''
-n_stars, r, v, verr = read_data.read_data(path_to_data)
+def _has_velocity_errors(verr) -> bool:
+    return not (np.isscalar(verr) and float(verr) == 0.0)
 
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+def analyze(
+    data,
+    position_cols=None,
+    velocity_cols=None,
+    velocity_error_cols=None,
+    error_flag: Optional[bool] = None,
+    dv_default: bool = True,
+    correct_inflation: bool = False,
+    bin_width: float = 0.1,
+    min_tail_pairs: int = 30,
+    **read_csv_kwargs,
+) -> VSATResult:
+    """Run VSAT on a CSV path or pandas DataFrame."""
 
-'''
-Calculate dr and dv for every possible pair of stars.
-Then sort the pairs into dr bins and calculate the mean dv in each
-bin with errors.
+    n_stars, r, v, verr = read_data.read_data(
+        data,
+        position_cols=position_cols,
+        velocity_cols=velocity_cols,
+        velocity_error_cols=velocity_error_cols,
+        **read_csv_kwargs,
+    )
+    if error_flag is None:
+        error_flag = _has_velocity_errors(verr)
 
-This function returns the number of bins (n_bins), the edges of the
-bins (edges), the mean dv in each bin (mean_dv), the uncertainty on each
-mean (error), the number of pairs in each bin (n_in_bins), and a count
-of how many times each star appears in each bin (count_stars_bins).
-'''
-n_bins, edges, mean_dv, error, n_in_bins, count_stars_bins = calc_drdv_and_sort.calc_drdv_and_sort(n_stars, r, v, verr, error_flag, dv_default, bin_width)
+    result = calc_drdv_and_sort.calc_drdv_and_sort(
+        n_stars,
+        r,
+        v,
+        verr,
+        error_flag,
+        dv_default,
+        bin_width,
+        min_tail_pairs=min_tail_pairs,
+    )
+    n_bins, edges, mean_dv, error, n_in_bins, count_stars_bins = result
+
+    if error_flag and correct_inflation:
+        first_uncertainty = np.asarray(verr, dtype=float).reshape(-1)[0]
+        mean_dv = correct_dv.correct(n_stars, v, first_uncertainty, mean_dv)
+
+    return VSATResult(n_bins, edges, mean_dv, error, n_in_bins, count_stars_bins)
 
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+def _split_columns(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    return value
 
 
-'''
-Observational errors artificially increase mean dv measured.
-Correct this inflation of dv if there are errors and the user
-has set the correct_inflation flag to True. Note that this
-function assumes the uncertainty on each velocity measurement
-is the same.
-'''
-if error_flag and correct_inflation:
+def build_parser():
+    parser = argparse.ArgumentParser(description="Velocity Structure Analysis Tool")
+    parser.add_argument("data", nargs="?", help="CSV catalog path")
+    parser.add_argument("--position-cols", help="Comma-separated position columns")
+    parser.add_argument("--velocity-cols", help="Comma-separated velocity columns")
+    parser.add_argument("--velocity-error-cols", help="Comma-separated velocity error columns")
+    parser.add_argument("--bin-width", type=float, default=parameters.DEFAULTS.bin_width)
+    parser.add_argument("--dr-start", type=float, default=parameters.DEFAULTS.dr_start)
+    parser.add_argument("--dr-end", type=float, default=parameters.DEFAULTS.dr_end)
+    parser.add_argument("--min-tail-pairs", type=int, default=30)
+    parser.add_argument(
+        "--errors",
+        dest="error_flag",
+        action="store_true",
+        default=None,
+        help="Force velocity-error weighting",
+    )
+    parser.add_argument(
+        "--no-errors",
+        dest="error_flag",
+        action="store_false",
+        help="Ignore velocity-error columns",
+    )
+    parser.add_argument(
+        "--radial-dv",
+        action="store_true",
+        help="Use dr/dt-style signed dv instead of velocity-difference magnitude",
+    )
+    parser.add_argument(
+        "--correct-inflation",
+        action="store_true",
+        default=parameters.DEFAULTS.correct_inflation,
+        help="Estimate and subtract measurement-error inflation",
+    )
+    parser.add_argument("--demo", action="store_true", help="Run the built-in demo catalog")
+    parser.add_argument("--no-show", action="store_true", help="Calculate without displaying plots")
+    return parser
 
-    mean_dv = correct_dv.correct(n_stars, v, verr[0][0], mean_dv)
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+
+    if args.demo:
+        n_stars, r, v, verr = read_data.test_2(seed=42)
+        error_flag = args.error_flag if args.error_flag is not None else True
+        result = calc_drdv_and_sort.calc_drdv_and_sort(
+            n_stars,
+            r,
+            v,
+            verr,
+            error_flag,
+            not args.radial_dv,
+            args.bin_width,
+            min_tail_pairs=args.min_tail_pairs,
+        )
+        vsat_result = VSATResult(*result)
+    else:
+        data = args.data or parameters.DEFAULTS.path_to_data
+        if not data:
+            raise SystemExit("Provide a CSV path or run with --demo.")
+        vsat_result = analyze(
+            data,
+            position_cols=_split_columns(args.position_cols),
+            velocity_cols=_split_columns(args.velocity_cols),
+            velocity_error_cols=_split_columns(args.velocity_error_cols),
+            error_flag=args.error_flag,
+            dv_default=not args.radial_dv,
+            correct_inflation=args.correct_inflation,
+            bin_width=args.bin_width,
+            min_tail_pairs=args.min_tail_pairs,
+        )
+
+    if args.no_show:
+        print(f"calculated {vsat_result.n_bins} populated dr bins")
+        return vsat_result
+
+    import plotting
+
+    plt = plotting._pyplot()
+    _, axes = plt.subplots(1, 2, figsize=(12, 5))
+    plotting.v_struct_plot(
+        vsat_result.edges, vsat_result.mean_dv, vsat_result.error, ax=axes[0]
+    )
+    if args.demo:
+        plot_r = r
+    else:
+        n_stars, plot_r, _, _ = read_data.read_data(
+            args.data,
+            position_cols=_split_columns(args.position_cols),
+            velocity_cols=_split_columns(args.velocity_cols),
+            velocity_error_cols=_split_columns(args.velocity_error_cols),
+        )
+    plotting.col_code_plot(
+        n_stars,
+        plot_r,
+        vsat_result.edges,
+        vsat_result.count_stars_bins,
+        args.dr_start,
+        args.dr_end,
+        ax=axes[1],
+    )
+    plt.tight_layout()
+    plt.show()
+    return vsat_result
 
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-# Plot results
-
-# Plot the velocity structure (dr vs mean_dv)
-plt.figure(1)
-plotting.v_struct_plot(edges, mean_dv, error)
-
-# Project the stars in 2D and colour code them according to how
-# often they appear in bins between dr_star and dr_end (which are
-# set in parameters.py).
-plt.figure(2)
-plotting.col_code_plot(n_stars, r, edges, count_stars_bins, dr_start, dr_end)
-
-# Display the results
-plt.show()
+if __name__ == "__main__":
+    main()
