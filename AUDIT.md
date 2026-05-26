@@ -14,6 +14,9 @@
   a TeX installation.
 - There were no automated tests around pair calculations, binning, catalog
   ingestion, or correction helpers.
+- A modernization pass briefly filtered out zero or near-zero velocity
+  differences. That is scientifically wrong for VSAT because co-moving pairs
+  with `dv = 0` are physically meaningful and must contribute to bin means.
 
 ## Changes made
 
@@ -27,6 +30,12 @@
   hard LaTeX dependency.
 - Added unittest coverage for numerical calculations, error weighting,
   DataFrame/CSV loading, and correction helper behavior.
+- Patched pair filtering so only zero/invalid separations and non-finite `dv`
+  values are removed in the unweighted path. Zero `dv_M` and `dv_D` values are
+  retained.
+- Guarded observational-error inflation correction so it is only applied to the
+  magnitude statistic `dv_M` and only for approximately uniform uncertainties.
+- Added bin-center reporting while retaining legacy edge labels.
 
 ## Remaining scientific limits
 
@@ -37,3 +46,5 @@
 - Gaia `ra/dec` and `pmra/pmdec` are accepted as tabular components, but no
   astrometric transformation is applied. If physical 3D positions and velocities
   are required, convert the catalog to consistent Cartesian units before VSAT.
+- The observational-error inflation correction does not implement a full
+  heteroscedastic Monte Carlo treatment for star-by-star velocity uncertainties.

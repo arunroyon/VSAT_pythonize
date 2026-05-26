@@ -3,12 +3,13 @@
 [![DOI](https://zenodo.org/badge/122964852.svg)](https://zenodo.org/badge/latestdoi/122964852)
 
 VSAT analyzes velocity structure in star clusters and associations following
-the method described in [Arnold & Goodwin (2018)](https://doi.org/10.1093/mnras/sty3409).
+the method described in [Arnold & Goodwin (2019)](https://doi.org/10.1093/mnras/sty3409)
+in MNRAS. The article appeared online in advance access in 2018.
 For every pair of stars, VSAT calculates their separation (`dr`) and velocity
 difference (`dv`), sorts those pairs into `dr` bins, and measures the mean
 `dv` in each bin.
 
-Please cite Arnold & Goodwin (2018) if this software is used in research
+Please cite Arnold & Goodwin (2019) if this software is used in research
 output.
 
 ## What changed in this Pythonized version
@@ -20,6 +21,8 @@ output.
 - Infers common Cartesian and Gaia-style column names, with explicit overrides.
 - Provides a reusable Python API (`main.analyze`) and a CLI.
 - Includes automated tests.
+- Retains physically meaningful zero-velocity-difference pairs in the VSAT
+  means, while still removing zero-separation pairs.
 
 The historical `fort_subroutines.f90` source remains for provenance, but the
 modern code path does not import Fortran or require a compiled extension.
@@ -86,17 +89,43 @@ result = analyze(
 )
 
 print(result.edges)
+print(result.bin_centers)
 print(result.mean_dv)
 ```
 
 `result` is a `VSATResult` dataclass with:
 
 - `n_bins`
-- `edges`
+- `edges`: legacy dr-bin lower-edge labels, retained for compatibility
+- `bin_centers`: property returning `edges + 0.5 * bin_width`
 - `mean_dv`
 - `error`
 - `n_in_bins`
 - `count_stars_bins`
+
+## VSAT Definitions
+
+VSAT supports the two pairwise velocity statistics used by the original code:
+
+- `dv_default=True`: magnitude velocity difference,
+  `dv_M = |v_i - v_j|`.
+- `dv_default=False`: directional velocity difference,
+  `dv_D = ((r_i - r_j) dot (v_i - v_j)) / |r_i - r_j|`.
+
+Pairs with zero or near-zero separation are removed because `dv_D` divides by
+`dr`. Pairs with zero velocity difference are retained. A zero `dv_M` or `dv_D`
+is physically meaningful and contributes to the mean velocity difference in its
+`dr` bin.
+
+When velocity errors are supplied, pairs are weighted by propagated `dv` errors.
+Pairs are removed from weighted calculations only when the propagated `dv_error`
+is non-finite or non-positive, because such pairs cannot be assigned a valid
+weight.
+
+The optional observational-error inflation correction is implemented only for
+`dv_M`, matching the treatment in Arnold & Goodwin (2019). It assumes
+approximately uniform velocity uncertainties. Heterogeneous uncertainties need a
+full Monte Carlo correction, which is not implemented here.
 
 ## Notes for Gaia-era catalogs
 

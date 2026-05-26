@@ -74,6 +74,86 @@ class PairCalculationTests(unittest.TestCase):
         self.assertEqual(n_pairs, 1)
         np.testing.assert_allclose(dr_dv[0, :2], [1.0, -2.0])
 
+    def test_zero_velocity_differences_are_retained_without_errors(self):
+        n_pairs, dr_dv, _ = vsat.calc_dr_dv(
+            3,
+            [[0.0, 1.0, 2.0]],
+            [[5.0, 5.0, 5.0]],
+            error_flag=False,
+            dv_default=True,
+            bin_width=1.0,
+        )
+
+        self.assertEqual(n_pairs, 3)
+        np.testing.assert_allclose(dr_dv[:, 1], [0.0, 0.0, 0.0])
+
+        result = vsat.calc_drdv_and_sort(
+            3,
+            [[0.0, 1.0, 2.0]],
+            [[5.0, 5.0, 5.0]],
+            error_flag=False,
+            dv_default=True,
+            bin_width=1.0,
+            min_tail_pairs=0,
+        )
+        _, _, mean_dv, error, n_in_bins, _ = result
+
+        np.testing.assert_allclose(mean_dv, [0.0, 0.0])
+        np.testing.assert_allclose(error, [0.0, 0.0])
+        np.testing.assert_allclose(n_in_bins, [2.0, 1.0])
+
+    def test_directional_dv_positive_for_v_equals_r(self):
+        n_pairs, dr_dv, _ = vsat.calc_dr_dv(
+            3,
+            [[0.0, 1.0, 2.0]],
+            [[0.0, 1.0, 2.0]],
+            error_flag=False,
+            dv_default=False,
+            bin_width=1.0,
+        )
+
+        self.assertEqual(n_pairs, 3)
+        self.assertTrue(np.all(dr_dv[:, 1] > 0.0))
+        np.testing.assert_allclose(np.sort(dr_dv[:, 1]), [1.0, 1.0, 2.0])
+
+    def test_directional_dv_negative_for_v_equals_minus_r(self):
+        n_pairs, dr_dv, _ = vsat.calc_dr_dv(
+            3,
+            [[0.0, 1.0, 2.0]],
+            [[0.0, -1.0, -2.0]],
+            error_flag=False,
+            dv_default=False,
+            bin_width=1.0,
+        )
+
+        self.assertEqual(n_pairs, 3)
+        self.assertTrue(np.all(dr_dv[:, 1] < 0.0))
+        np.testing.assert_allclose(np.sort(dr_dv[:, 1]), [-2.0, -1.0, -1.0])
+
+    def test_directional_zero_values_contribute_to_bin_mean(self):
+        result = vsat.calc_drdv_and_sort(
+            4,
+            [[0.0, 1.0, 2.0, 3.0]],
+            [[0.0, 0.0, 1.0, -1.0]],
+            error_flag=False,
+            dv_default=False,
+            bin_width=10.0,
+            min_tail_pairs=0,
+        )
+
+        n_bins, edges, mean_dv, _, n_in_bins, _ = result
+
+        self.assertEqual(n_bins, 1)
+        np.testing.assert_allclose(edges, [0.0])
+        np.testing.assert_allclose(n_in_bins, [6.0])
+        np.testing.assert_allclose(mean_dv, [-1.0 / 3.0])
+
+    def test_bin_centers_from_legacy_edges(self):
+        np.testing.assert_allclose(
+            vsat.bin_centers([0.0, 1.0, 2.0], bin_width=1.0),
+            [0.5, 1.5, 2.5],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

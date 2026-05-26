@@ -7,6 +7,36 @@ import numpy as np
 from calc_drdv_and_sort import as_component_matrix
 
 
+def uniform_uncertainty(verr, rtol: float = 0.05, atol: float = 0.0) -> float:
+    """Return a representative uncertainty if all velocity errors are uniform.
+
+    The analytic-style inflation correction implemented here assumes every
+    velocity measurement has approximately the same uncertainty.  A full
+    heteroscedastic Monte Carlo correction is not implemented.
+    """
+
+    if np.isscalar(verr):
+        uncertainty = float(verr)
+        if not np.isfinite(uncertainty) or uncertainty <= 0:
+            raise ValueError("velocity uncertainty must be finite and positive")
+        return uncertainty
+
+    uncertainties = np.asarray(verr, dtype=float)
+    if uncertainties.size == 0:
+        raise ValueError("velocity uncertainties are required for correction")
+    if not np.all(np.isfinite(uncertainties)) or np.any(uncertainties <= 0):
+        raise ValueError("velocity uncertainties must be finite and positive")
+
+    reference = float(uncertainties.flat[0])
+    if not np.allclose(uncertainties, reference, rtol=rtol, atol=atol):
+        raise ValueError(
+            "correct_inflation assumes approximately uniform velocity "
+            "uncertainties; heterogeneous uncertainties require a full Monte "
+            "Carlo correction, which is not implemented"
+        )
+    return float(np.mean(uncertainties))
+
+
 def average_pairwise_velocity_difference(v, block_size: int = 512) -> float:
     """Average pairwise velocity difference without requiring Fortran."""
 
