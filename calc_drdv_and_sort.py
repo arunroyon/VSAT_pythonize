@@ -1,198 +1,358 @@
+"""Vectorized velocity-structure calculations for VSAT.
+
+The original project delegated the pairwise distance/velocity calculations and
+binning to f2py-built Fortran routines.  This module keeps the public function
+names used by the old scripts, but the implementation is pure Python/NumPy and
+works on modern Python without a compiled extension.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional, Tuple
+
 import numpy as np
-# Import the subroutines written in fortran
-try:
-    import fort_subroutines
-except ImportError as failed_import:
-    print('\n\n', failed_import)
-    print ('Likely cause: running the code with python 3 or later.')
-    print('Suggest running with python 2.7.\n\n')
-    import sys
-    sys.exit()
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-'''
-For every possible pair of stars calculate the distance between them, dr
-and the difference in their velocities, dv.
-If there are errors on the velocities then propagate them to get the
-errors on the dvs.
+ZERO_TOLERANCE = 1.0e-5
 
-This function returns the number of pairs (n_pairs), and array with the
-drs, corresponding dvs and, if there are errors, the errors on the dvs (dr_dv),
-and the largest dr (max_dr).
 
-Much of the work of this function is done by a fortran subroutine as
-fortran is significantly faster than python at number crunching.
-The time saving due to this is small for a single snapshot
-however for a many snapshots (e.g. if analysing every timestep of a simulation)
-then it becomes significant.
+@dataclass(frozen=True)
+class PairMetrics:
+    """Pairwise dr/dv values and the star indices that produced them."""
 
-The package f2py was used to make the fortran subroutine compatible with python.
-If for any reason the user wishes to make changes to the subroutine then
-they will need to build their altered version with f2py.
-'''
-def calc_dr_dv(n_stars, r, v, verr, error_flag, dv_default, bin_width):
+    n_pairs: int
+    dr_dv: np.ndarray
+    max_dr: float
+    pair_indices: Tuple[np.ndarray, np.ndarray]
 
-    # Get the number of possible pairs of stars
-    n_pairs = ((n_stars*n_stars) - n_stars) / 2
 
-    '''
-    This subroutine returns an array containing the dr and corresponding dv
-    for every pair of stars, and the error on dv (if there are velocity errors).
-    If there are no velocity errors then that column is all zeros.
-    It also returns the largest dr in the cluster so we know the biggest dr bin that
-    will be needed.
-    '''
-    if error_flag:
-        dr_dv, max_dr = fort_subroutines.calc_dr_dv(n_stars, n_pairs, bin_width, len(r), r, len(v), v, error_flag, dv_default, verr)
+def as_component_matrix(values, name: str, expected_n: Optional[int] = None) -> np.ndarray:
+    """Return values as a ``(n_components, n_stars)`` float array.
 
-        # Remove any pairs with exacly 0 dr, dv, or error.
-        # These pairs will be very rare, and they screw up the error calculation
-        remove_list = []
-        for pair in range(n_pairs):
-            
-            if (abs(dr_dv[pair][0]) < 0.00001) or (abs(dr_dv[pair][1]) < 0.00001) or (abs(dr_dv[pair][2]) < 0.00001):
-                
-                remove_list.append(pair)
-                
+    Existing VSAT code stores component arrays as ``[[x...], [y...], [z...]]``.
+    Data-frame oriented code often produces ``(n_stars, n_components)`` arrays.
+    This helper accepts both forms and transposes the latter when it can do so
+    unambiguously.
+    """
+
+    array = np.asarray(values, dtype=float)
+    if array.ndim == 0:
+        raise ValueError(f"{name} must contain one or more components")
+    if array.ndim == 1:
+        array = array.reshape(1, -1)
+    elif array.ndim == 2:
+        if expected_n is not None:
+            if array.shape[1] == expected_n:
+                pass
+            elif array.shape[0] == expected_n:
+                array = array.T
+            else:
+                raise ValueError(
+                    f"{name} has shape {array.shape}, but expected {expected_n} stars"
+                )
+        elif array.shape[0] > array.shape[1] and array.shape[1] <= 8:
+            array = array.T
     else:
-        dr_dv, max_dr = fort_subroutines.calc_dr_dv(n_stars, n_pairs, bin_width, len(r), r, len(v), v, error_flag, dv_default)
+        raise ValueError(f"{name} must be a 1D or 2D array")
 
-        # Remove any pairs with exacly dr or dv.
-        # These pairs will be very rare, and they screw up the error calculation
-        remove_list = []
-        for pair in range(n_pairs):
-            
-            if (abs(dr_dv[pair][0]) < 0.00001) or (abs(dr_dv[pair][1]) < 0.00001):
-                
-                remove_list.append(pair)
+    if array.shape[1] < 2:
+        raise ValueError(f"{name} must contain at least two stars")
+    if not np.all(np.isfinite(array)):
+        raise ValueError(f"{name} contains NaN or infinite values")
+    return np.ascontiguousarray(array, dtype=float)
 
-    #Remove the zero pairs
-    remove_list.reverse()
-    for remove in remove_list:
 
-        dr_dv = np.delete(dr_dv, (remove), axis=0)
+def _velocity_error_matrix(verr, v: np.ndarray, error_flag: bool) -> Optional[np.ndarray]:
+    if not error_flag:
+        return None
+    if verr is None:
+        raise ValueError("verr is required when error_flag=True")
+    if np.isscalar(verr):
+        uncertainty = float(verr)
+        if uncertainty <= 0:
+            raise ValueError("verr must be positive when error_flag=True")
+        return np.full_like(v, uncertainty, dtype=float)
 
-    n_pairs = len(dr_dv)
+    verr_array = as_component_matrix(verr, "verr", expected_n=v.shape[1])
+    if verr_array.shape != v.shape:
+        raise ValueError(
+            f"verr has shape {verr_array.shape}; expected the velocity shape {v.shape}"
+        )
+    if np.any(verr_array <= 0):
+        raise ValueError("velocity errors must be positive")
+    return verr_array
 
-    return n_pairs, dr_dv, max_dr
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+def _validate_inputs(n_stars, r, v, verr, error_flag):
+    n_stars = int(n_stars)
+    if n_stars < 2:
+        raise ValueError("at least two stars are required")
 
-'''
-This function sorts the pairs of stars into dr bins. It then calculates the
-mean dv in each bin.
+    r_array = as_component_matrix(r, "r", expected_n=n_stars)
+    v_array = as_component_matrix(v, "v", expected_n=n_stars)
+    if r_array.shape[1] != n_stars or v_array.shape[1] != n_stars:
+        raise ValueError("n_stars does not match r/v data")
 
-It returns the edges of the bins (edges), the number of
-bins (n_bins) the mean dv in each bin (mean_dv), the uncertainty on each mean
-(error), the number of pairs in each bin (n_in_bins), and a count of how many
-times each star appears in each bin (count_stars_bins).
+    verr_array = _velocity_error_matrix(verr, v_array, bool(error_flag))
+    return n_stars, r_array, v_array, verr_array
 
-As in the above section much of the work of this function is done by a fortran
-subroutine as fortran is significantly faster than python at number crunching.
-If the user wishes to make changes to this subroutine then they will need to
-build their altered version with f2py.
-'''
-def sort_into_bins(n_stars, n_pairs, dr_dv, max_dr, bin_width, error_flag):
 
-    # Define the bin edges, and define the number of bins
-    edges = list(np.arange(0, max_dr, bin_width))
+def _pairwise_metrics(
+    n_stars,
+    r,
+    v,
+    verr=0,
+    error_flag=False,
+    dv_default=True,
+    bin_width=0.1,
+    zero_tolerance=ZERO_TOLERANCE,
+) -> PairMetrics:
+    n_stars, r_array, v_array, verr_array = _validate_inputs(
+        n_stars, r, v, verr, error_flag
+    )
+    if bin_width <= 0:
+        raise ValueError("bin_width must be positive")
+    if not dv_default and r_array.shape[0] != v_array.shape[0]:
+        raise ValueError(
+            "dv_default=False requires positions and velocities to have the same dimensions"
+        )
+
+    star_a, star_b = np.triu_indices(n_stars, k=1)
+    r_delta = r_array[:, star_a] - r_array[:, star_b]
+    v_delta = v_array[:, star_a] - v_array[:, star_b]
+
+    dr = np.linalg.norm(r_delta, axis=0)
+    if dv_default:
+        dv = np.linalg.norm(v_delta, axis=0)
+    else:
+        dv = np.einsum("ij,ij->j", r_delta, v_delta) / dr
+
+    valid = (np.abs(dr) >= zero_tolerance) & (np.abs(dv) >= zero_tolerance)
+
+    if error_flag:
+        verr_squares = verr_array[:, star_a] ** 2 + verr_array[:, star_b] ** 2
+        if dv_default:
+            numerator = np.sqrt(np.sum((v_delta**2) * verr_squares, axis=0))
+            denominator = np.abs(dv)
+        else:
+            numerator = np.sqrt(np.sum((r_delta**2) * verr_squares, axis=0))
+            denominator = dr
+
+        dv_error = np.full_like(numerator, np.nan, dtype=float)
+        np.divide(
+            numerator,
+            denominator,
+            out=dv_error,
+            where=np.abs(denominator) >= zero_tolerance,
+        )
+        valid &= np.isfinite(dv_error) & (np.abs(dv_error) >= zero_tolerance)
+    else:
+        dv_error = np.zeros_like(dv)
+
+    dr = dr[valid]
+    dv = dv[valid]
+    dv_error = dv_error[valid]
+    star_a = star_a[valid]
+    star_b = star_b[valid]
+
+    if len(dr) == 0:
+        raise ValueError("no valid star pairs remain after filtering zero dr/dv pairs")
+
+    dr_dv = np.column_stack((dr, dv, dv_error))
+    max_dr = float(np.max(dr) + (2.0 * bin_width))
+    return PairMetrics(len(dr_dv), dr_dv, max_dr, (star_a, star_b))
+
+
+def calc_dr_dv(
+    n_stars,
+    r,
+    v,
+    verr=0,
+    error_flag=False,
+    dv_default=True,
+    bin_width=0.1,
+):
+    """Calculate ``dr`` and ``dv`` for every valid pair of stars.
+
+    Returns the legacy tuple ``(n_pairs, dr_dv, max_dr)``.  ``dr_dv`` is an
+    ``(n_pairs, 3)`` array with columns ``dr``, ``dv``, and ``dv_error``.
+    """
+
+    metrics = _pairwise_metrics(
+        n_stars, r, v, verr, error_flag, dv_default, bin_width
+    )
+    return metrics.n_pairs, metrics.dr_dv, metrics.max_dr
+
+
+def _legacy_pair_indices(n_stars: int, n_pairs: int) -> Tuple[np.ndarray, np.ndarray]:
+    star_a, star_b = np.triu_indices(int(n_stars), k=1)
+    if n_pairs > len(star_a):
+        raise ValueError("n_pairs is larger than the number of possible star pairs")
+    return star_a[:n_pairs], star_b[:n_pairs]
+
+
+def sort_into_bins(
+    n_stars,
+    n_pairs,
+    dr_dv,
+    max_dr,
+    bin_width,
+    error_flag,
+    pair_indices: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+):
+    """Sort pairwise dr/dv values into dr bins and calculate bin statistics."""
+
+    if bin_width <= 0:
+        raise ValueError("bin_width must be positive")
+    dr_dv = np.asarray(dr_dv, dtype=float)
+    if dr_dv.ndim != 2 or dr_dv.shape[1] < 3:
+        raise ValueError("dr_dv must be an array with columns dr, dv, dv_error")
+
+    n_pairs = int(n_pairs)
+    n_stars = int(n_stars)
+    edges = np.arange(0.0, float(max_dr), float(bin_width))
     n_bins = len(edges)
+    if n_bins == 0:
+        raise ValueError("no bins were produced; check max_dr and bin_width")
 
-    # Sort the pairs of stars into dr bins then calculate the mean dv in each.
-    if error_flag:
-        mean_dv, error, n_in_bins, count_stars_bins = fort_subroutines.sort_errors(n_stars, n_pairs, n_bins, dr_dv, bin_width)
+    if pair_indices is None:
+        star_a, star_b = _legacy_pair_indices(n_stars, n_pairs)
     else:
-        mean_dv, error, n_in_bins, count_stars_bins = fort_subroutines.sort_no_errors(n_stars, n_pairs, n_bins, dr_dv, bin_width)
+        star_a, star_b = pair_indices
+        star_a = np.asarray(star_a, dtype=int)
+        star_b = np.asarray(star_b, dtype=int)
+    if len(star_a) != n_pairs or len(star_b) != n_pairs:
+        raise ValueError("pair_indices length must match n_pairs")
+
+    pair_bins = np.ceil(dr_dv[:, 0] / bin_width).astype(int) - 1
+    pair_bins = np.clip(pair_bins, 0, n_bins - 1)
+
+    n_in_bins = np.bincount(pair_bins, minlength=n_bins).astype(float)
+    count_stars_bins = np.zeros((n_bins, n_stars), dtype=int)
+    np.add.at(count_stars_bins, (pair_bins, star_a), 1)
+    np.add.at(count_stars_bins, (pair_bins, star_b), 1)
+
+    if error_flag:
+        dv_error = dr_dv[:, 2]
+        weights = 1.0 / (dv_error**2)
+        a = np.bincount(pair_bins, weights=(dr_dv[:, 1] / dv_error) ** 2, minlength=n_bins)
+        b = np.bincount(pair_bins, weights=weights, minlength=n_bins)
+        c = np.bincount(pair_bins, weights=dr_dv[:, 1] * weights, minlength=n_bins)
+
+        mean_dv = np.full(n_bins, np.nan)
+        error = np.full(n_bins, np.nan)
+        occupied = (n_in_bins > 0) & (b > 0)
+        mean_dv[occupied] = c[occupied] / b[occupied]
+        err_dv = np.zeros(n_bins)
+        std_er = np.zeros(n_bins)
+        err_dv[occupied] = np.sqrt(1.0 / b[occupied])
+        scatter = (a[occupied] * b[occupied]) - (c[occupied] ** 2)
+        scatter = np.maximum(scatter, 0.0)
+        std_er[occupied] = (1.0 / b[occupied]) * np.sqrt(
+            scatter / n_in_bins[occupied]
+        )
+        error[occupied] = np.sqrt((err_dv[occupied] ** 2) + (std_er[occupied] ** 2))
+    else:
+        sum_dv = np.bincount(pair_bins, weights=dr_dv[:, 1], minlength=n_bins)
+        sum_dv_sq = np.bincount(pair_bins, weights=dr_dv[:, 1] ** 2, minlength=n_bins)
+
+        mean_dv = np.full(n_bins, np.nan)
+        error = np.full(n_bins, np.nan)
+        occupied = n_in_bins > 0
+        mean_dv[occupied] = sum_dv[occupied] / n_in_bins[occupied]
+        variance = (sum_dv_sq[occupied] / n_in_bins[occupied]) - (
+            mean_dv[occupied] ** 2
+        )
+        variance = np.maximum(variance, 0.0)
+        error[occupied] = np.sqrt(variance) / np.sqrt(n_in_bins[occupied])
 
     return edges, n_bins, mean_dv, error, n_in_bins, count_stars_bins
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-'''
-Tidy up function, just makes the resulting plots neater.
+def tidy_up(
+    n_bins,
+    edges,
+    mean_dv,
+    error,
+    n_in_bins,
+    count_stars_bins,
+    min_tail_pairs=30,
+):
+    """Remove empty bins and sparse high-dr tails.
 
-High dr bins contain few pairs because only stars on the extreme
-outskirts are far enough apart to populate them, and by definition
-there are few stars on the outskirts of a cluster. If a bin contains
-few pairs its mean dv is unreliable and often noisy. Therefore we get
-rid of bins at high dr.
+    ``min_tail_pairs`` keeps the historical VSAT behavior of trimming the
+    high-dr tail once the average remaining occupancy drops below 30 pairs.
+    Small catalogs are protected from being trimmed down to zero bins.
+    """
 
-Also get rid of any empty bins.
-'''
-def tidy_up(n_bins, edges, mean_dv, error, n_in_bins, count_stars_bins):
+    n_bins = int(n_bins)
+    edges = np.asarray(edges, dtype=float)
+    mean_dv = np.asarray(mean_dv, dtype=float)
+    error = np.asarray(error, dtype=float)
+    n_in_bins = np.asarray(n_in_bins, dtype=float)
+    count_stars_bins = np.asarray(count_stars_bins)
 
-    # Get rid of high dv bins.
-    # Define high dr as the dr beyond which the average number of pairs per
-    # bin is < 10. Find that cutoff.
-    for i in range(n_bins):
+    if n_bins == 0:
+        return n_bins, edges, mean_dv, error, n_in_bins, count_stars_bins
 
-        # Get the average number of pairs per bin for bins with dr >= this one
-        av_numb_in_bins = sum(n_in_bins[i:])/float(n_bins - i)
+    keep_until = n_bins
+    if min_tail_pairs is not None and min_tail_pairs > 0:
+        tail_counts = np.cumsum(n_in_bins[::-1])[::-1]
+        tail_widths = np.arange(n_bins, 0, -1, dtype=float)
+        sparse_tail = np.flatnonzero((tail_counts / tail_widths) < min_tail_pairs)
+        if len(sparse_tail) > 0:
+            keep_until = int(sparse_tail[0])
+            if keep_until == 0 and np.any(n_in_bins > 0):
+                keep_until = int(np.flatnonzero(n_in_bins > 0)[-1] + 1)
 
-        # It the average number of pairs per bin is < 30 then the bins
-        # beyond this point are likely noisy and unreliable
-        # Therefore want to cut any bins beyond this cutoff point
-        if av_numb_in_bins < 30:
+    edges = edges[:keep_until]
+    mean_dv = mean_dv[:keep_until]
+    error = error[:keep_until]
+    n_in_bins = n_in_bins[:keep_until]
+    count_stars_bins = count_stars_bins[:keep_until]
 
-            cutoff_bin = i
-
-            break
-
-    # Get rid of the bins above the cutoff bin
-    edges = edges[:cutoff_bin]
-    mean_dv = mean_dv[:cutoff_bin]
-    error = error[:cutoff_bin]
-    n_in_bins = n_in_bins[:cutoff_bin]
-    count_stars_bins = count_stars_bins[:cutoff_bin]
-
-    # The number of bins has changed now the outermost have been cut.
-    # Recalculate.
-    n_bins = len(mean_dv)
-
-    # - - - - - - - - - - - - - - - - -
-
-    # Get rid of any empty bins.
-
-    # Figure out which bins to remove
-    # Reversing the order just makes it easier to delete them without
-    # screwing up the indecies
-    remove_list = [i for i in range(n_bins) if n_in_bins[i] == 0.]
-    remove_list.reverse()
-
-    # Remove the empty bins
-    for empty in remove_list:
-
-        edges = np.delete(edges, empty)
-        mean_dv = np.delete(mean_dv, empty)
-        error = np.delete(error, empty)
-        n_in_bins = np.delete(n_in_bins, empty)
-        count_stars_bins = np.delete(count_stars_bins, empty)
-
-    # The number of bins has changed now the empty ones have been
-    # deleted. Recalculate.
+    occupied = n_in_bins > 0
+    edges = edges[occupied]
+    mean_dv = mean_dv[occupied]
+    error = error[occupied]
+    n_in_bins = n_in_bins[occupied]
+    count_stars_bins = count_stars_bins[occupied]
     n_bins = len(edges)
 
     return n_bins, edges, mean_dv, error, n_in_bins, count_stars_bins
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-'''
-This function calculates dr and dv for every possible pair of stars.
-It then sorts the pairs into dr bins and calculates the mean dv in each
-bin with errors. Finally it tidies up, which just produces neater plots.
+def calc_drdv_and_sort(
+    n_stars,
+    r,
+    v,
+    verr=0,
+    error_flag=False,
+    dv_default=True,
+    bin_width=0.1,
+    min_tail_pairs=30,
+):
+    """Calculate pairwise dr/dv values, bin them, and return VSAT statistics."""
 
-This function returns the number of bins (n_bins), the edges of the
-bins (edges), the mean dv in each bin (mean_dv), the uncertainty on each
-mean (error), the number of pairs in each bin (n_in_bins), and a count
-of how many times each star appears in each bin (count_stars_bins).
-'''
-def calc_drdv_and_sort(n_stars, r, v, verr, error_flag, dv_default, bin_width):
-
-    n_pairs, dr_dv, max_dr = calc_dr_dv(n_stars, r, v, verr, error_flag, dv_default, bin_width)
-
-    edges, n_bins, mean_dv, error, n_in_bins, count_stars_bins = sort_into_bins(n_stars, n_pairs, dr_dv, max_dr, bin_width, error_flag)
-
-    n_bins, edges, mean_dv, error, n_in_bins, count_stars_bins = tidy_up(n_bins, edges, mean_dv, error, n_in_bins, count_stars_bins)
-
-    return n_bins, edges, mean_dv, error, n_in_bins, count_stars_bins
+    metrics = _pairwise_metrics(
+        n_stars, r, v, verr, error_flag, dv_default, bin_width
+    )
+    edges, n_bins, mean_dv, error, n_in_bins, count_stars_bins = sort_into_bins(
+        n_stars,
+        metrics.n_pairs,
+        metrics.dr_dv,
+        metrics.max_dr,
+        bin_width,
+        error_flag,
+        pair_indices=metrics.pair_indices,
+    )
+    return tidy_up(
+        n_bins,
+        edges,
+        mean_dv,
+        error,
+        n_in_bins,
+        count_stars_bins,
+        min_tail_pairs=min_tail_pairs,
+    )

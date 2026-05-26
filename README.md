@@ -2,65 +2,127 @@
 
 [![DOI](https://zenodo.org/badge/122964852.svg)](https://zenodo.org/badge/latestdoi/122964852)
 
-Description
----
+VSAT analyzes velocity structure in star clusters and associations following
+the method described in [Arnold & Goodwin (2018)](https://doi.org/10.1093/mnras/sty3409).
+For every pair of stars, VSAT calculates their separation (`dr`) and velocity
+difference (`dv`), sorts those pairs into `dr` bins, and measures the mean
+`dv` in each bin.
 
-VSAT is a tool for analysing velocity structure in star clusters/associations 
-following the method described in [Arnold & Goodwin (2018)](https://doi.org/10.1093/mnras/sty3409). 
-We request that this paper is cited if this software is used to produce a research output (e.g. an academic paper).
-In short, for every possible pair of stars the distance
-between them (dr) and their velocity difference (dv) is calculated.
-Pairs are then sorted into dr bins. In each bin the mean dv of
-the pairs it contains is calculated. These mean dvs are plotted
-as a function of dr. This is the velocity structure. 
+Please cite Arnold & Goodwin (2018) if this software is used in research
+output.
 
-To help investigate the velocity structure a second plot is produced. It
-shows a 2D projection of the stars. The stars are colour coded according to
-how often they appear in user-specified dr bins. Understanding which stars
-contribute most heavily to different parts of the velocity structure is
-often helpful for interpreting it. This is described in more detail in
-[Arnold & Goodwin (2018)](https://doi.org/10.1093/mnras/sty3409).
+## What changed in this Pythonized version
 
-This program is not dependent on the units of the data inputted,
-although pc and km/s are assumed and used to label figure
-axes.
+- Runs on modern Python without the old f2py/Fortran extension at runtime.
+- Uses NumPy vectorized calculations for pair distances, velocity differences,
+  bin means, and bin errors.
+- Reads CSV files or pandas DataFrames directly.
+- Infers common Cartesian and Gaia-style column names, with explicit overrides.
+- Provides a reusable Python API (`main.analyze`) and a CLI.
+- Includes automated tests.
 
-Structure of the program
----
+The historical `fort_subroutines.f90` source remains for provenance, but the
+modern code path does not import Fortran or require a compiled extension.
 
-1. Set parameters and flags
-2. Read in the data
-3. Calculate dr and dv for every pair of stars
-4. Sort pairs into dr bins and calculate the mean dv in each bin with errors
-5. Tidy up and get rid of any empty bins
-6. Correct the inflation of mean dv due to uncertainties (if desired)
-7. Make plots of the data- 1st plot: velocity structure
-8. 2nd plot: positions of the stars with the stars colour coded
+## Installation
 
-How to run
----
+```bash
+python -m pip install -e .
+```
 
-* In parameters.py set the path_to_data variable to the path to the data file.
-* In parameters.py set the error_flag to True or False depending on whether
-or not the velocity data has observational errors.
-* In read_data.py fill in the read_data function to read in the data in the necessary format, which is described in comments.
-* Run main.py from the command line like any other python script.
+For test tooling:
 
-The user can set dr_start and dr_end in parameters.py to specify which
-dr bins to colour code the second plot by.
+```bash
+python -m pip install -e ".[test]"
+```
 
-This program was written using python version 2.7.13, and may 
-encounter errors if run with later versions.
+## Command-line use
 
-License information
----
+Run against a CSV with inferred columns:
 
-VSAT has an MIT license, reflecting that it is free and users are
-welcome to modify it to better suit their needs or make improvements,
-but there is no warranty.
+```bash
+python main.py catalog.csv
+```
 
-Contact information
----
+For Gaia-style projected quantities, VSAT will infer `ra`, `dec`, `pmra`,
+`pmdec`, and matching error columns such as `pmra_error` and `pmdec_error`.
+For Cartesian catalogs, it will infer `x/y/z` and `vx/vy/vz` where present.
 
-For further information please contact Becky Arnold at
-r.j.arnold.uk@gmail.com. 
+Use explicit columns when a catalog has different names:
+
+```bash
+python main.py catalog.csv \
+  --position-cols x,y,z \
+  --velocity-cols vx,vy,vz \
+  --velocity-error-cols vx_error,vy_error,vz_error
+```
+
+Calculate without displaying plots:
+
+```bash
+python main.py catalog.csv --no-show
+```
+
+Run the built-in linear-structure demo:
+
+```bash
+python main.py --demo
+```
+
+## Python API
+
+```python
+import pandas as pd
+from main import analyze
+
+df = pd.read_csv("catalog.csv")
+
+result = analyze(
+    df,
+    position_cols=["ra", "dec"],
+    velocity_cols=["pmra", "pmdec"],
+    velocity_error_cols=["pmra_error", "pmdec_error"],
+    bin_width=0.1,
+)
+
+print(result.edges)
+print(result.mean_dv)
+```
+
+`result` is a `VSATResult` dataclass with:
+
+- `n_bins`
+- `edges`
+- `mean_dv`
+- `error`
+- `n_in_bins`
+- `count_stars_bins`
+
+## Notes for Gaia-era catalogs
+
+VSAT is still an all-pairs analysis, so runtime and memory grow as O(N^2).
+Use scientifically motivated cuts before running very large catalogs.
+
+`ra/dec` and `pmra/pmdec` can be used as components, but VSAT does not convert
+astrometry into physical Cartesian coordinates. If your analysis requires pc and
+km/s, transform Gaia quantities into consistent physical units before running
+VSAT.
+
+## Tests
+
+The suite uses the standard library `unittest` runner:
+
+```bash
+python -m unittest discover
+```
+
+If `pytest` is installed, this also works:
+
+```bash
+pytest
+```
+
+## License
+
+VSAT has an MIT license. It is free to use and modify, but comes without
+warranty.

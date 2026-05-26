@@ -1,0 +1,18 @@
+# Local data and generated analysis artifacts
+csvs/
+vsat_results*/
+vsat_plots*/
+
+# Python caches and build outputs
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# Platform/editor noise
+.DS_Store
+
+# Compiled extensions are not needed for the modern NumPy implementation
+*.so
