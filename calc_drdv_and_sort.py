@@ -27,6 +27,19 @@ class PairMetrics:
     pair_indices: Tuple[np.ndarray, np.ndarray]
 
 
+def bin_centers(edges, bin_width: float) -> np.ndarray:
+    """Return bin centers from the legacy edge labels and bin width.
+
+    The legacy VSAT return value named ``edges`` is retained for compatibility
+    with the original scripts.  For plotting and interpretation, the center of
+    each dr bin is usually clearer: ``edge + 0.5 * bin_width``.
+    """
+
+    if bin_width <= 0:
+        raise ValueError("bin_width must be positive")
+    return np.asarray(edges, dtype=float) + (0.5 * float(bin_width))
+
+
 def as_component_matrix(values, name: str, expected_n: Optional[int] = None) -> np.ndarray:
     """Return values as a ``(n_components, n_stars)`` float array.
 
@@ -123,12 +136,15 @@ def _pairwise_metrics(
     v_delta = v_array[:, star_a] - v_array[:, star_b]
 
     dr = np.linalg.norm(r_delta, axis=0)
+    valid = (dr > zero_tolerance) & np.isfinite(dr)
     if dv_default:
         dv = np.linalg.norm(v_delta, axis=0)
     else:
-        dv = np.einsum("ij,ij->j", r_delta, v_delta) / dr
+        numerator = np.einsum("ij,ij->j", r_delta, v_delta)
+        dv = np.full_like(numerator, np.nan, dtype=float)
+        np.divide(numerator, dr, out=dv, where=valid)
 
-    valid = (np.abs(dr) >= zero_tolerance) & (np.abs(dv) >= zero_tolerance)
+    valid &= np.isfinite(dv)
 
     if error_flag:
         verr_squares = verr_array[:, star_a] ** 2 + verr_array[:, star_b] ** 2
@@ -146,7 +162,7 @@ def _pairwise_metrics(
             out=dv_error,
             where=np.abs(denominator) >= zero_tolerance,
         )
-        valid &= np.isfinite(dv_error) & (np.abs(dv_error) >= zero_tolerance)
+        valid &= np.isfinite(dv_error) & (dv_error > 0.0)
     else:
         dv_error = np.zeros_like(dv)
 
@@ -157,7 +173,10 @@ def _pairwise_metrics(
     star_b = star_b[valid]
 
     if len(dr) == 0:
-        raise ValueError("no valid star pairs remain after filtering zero dr/dv pairs")
+        raise ValueError(
+            "no valid star pairs remain after filtering zero/invalid dr values "
+            "and non-finite dv or dv_error values"
+        )
 
     dr_dv = np.column_stack((dr, dv, dv_error))
     max_dr = float(np.max(dr) + (2.0 * bin_width))
@@ -201,7 +220,11 @@ def sort_into_bins(
     error_flag,
     pair_indices: Optional[Tuple[np.ndarray, np.ndarray]] = None,
 ):
-    """Sort pairwise dr/dv values into dr bins and calculate bin statistics."""
+    """Sort pairwise dr/dv values into dr bins and calculate bin statistics.
+
+    The returned ``edges`` array is the legacy lower-edge label for each
+    retained bin.  Use :func:`bin_centers` when plotting against bin centers.
+    """
 
     if bin_width <= 0:
         raise ValueError("bin_width must be positive")
@@ -333,7 +356,12 @@ def calc_drdv_and_sort(
     bin_width=0.1,
     min_tail_pairs=30,
 ):
-    """Calculate pairwise dr/dv values, bin them, and return VSAT statistics."""
+    """Calculate pairwise dr/dv values, bin them, and return VSAT statistics.
+
+    Returns the legacy 6-tuple ``(n_bins, edges, mean_dv, error, n_in_bins,
+    count_stars_bins)``.  ``edges`` is retained for compatibility; bin centers
+    can be calculated with ``bin_centers(edges, bin_width)``.
+    """
 
     metrics = _pairwise_metrics(
         n_stars, r, v, verr, error_flag, dv_default, bin_width

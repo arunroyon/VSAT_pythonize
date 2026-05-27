@@ -16,8 +16,8 @@ def _pyplot():
     return plt
 
 
-def v_struct_plot(edges, mean_dv, error, ax=None):
-    """Plot velocity structure as mean dv versus dr-bin lower edge."""
+def v_struct_plot(edges, mean_dv, error, ax=None, bin_width=None):
+    """Plot velocity structure as mean dv versus dr-bin lower edge or center."""
 
     plt = _pyplot()
     if ax is None:
@@ -29,8 +29,14 @@ def v_struct_plot(edges, mean_dv, error, ax=None):
     if len(edges) == 0:
         raise ValueError("no bins to plot")
 
-    ax.errorbar(edges, mean_dv, yerr=error, capsize=3.0)
-    ax.set_xlabel(r"$\Delta r$ (pc)")
+    plot_x = edges
+    xlabel = r"$\Delta r$ bin lower edge (pc)"
+    if bin_width is not None:
+        plot_x = edges + (0.5 * float(bin_width))
+        xlabel = r"$\Delta r$ bin center (pc)"
+
+    ax.errorbar(plot_x, mean_dv, yerr=error, capsize=3.0)
+    ax.set_xlabel(xlabel)
     ax.set_ylabel(r"$\Delta v$ (km s$^{-1}$)")
     ax.set_title("Velocity structure")
     ax.set_xlim(left=0.0, right=float(edges[-1]) if len(edges) else 1.0)

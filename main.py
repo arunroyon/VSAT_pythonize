@@ -22,10 +22,43 @@ class VSATResult:
     error: np.ndarray
     n_in_bins: np.ndarray
     count_stars_bins: np.ndarray
+    bin_width: Optional[float] = None
+
+    @property
+    def bin_centers(self) -> np.ndarray:
+        """Centers of the dr bins corresponding to ``edges``."""
+
+        if self.bin_width is None:
+            raise ValueError("bin_width is required to calculate bin centers")
+        return calc_drdv_and_sort.bin_centers(self.edges, self.bin_width)
 
 
 def _has_velocity_errors(verr) -> bool:
     return not (np.isscalar(verr) and float(verr) == 0.0)
+
+
+def _apply_inflation_correction(
+    n_stars,
+    v,
+    verr,
+    mean_dv,
+    error_flag: bool,
+    dv_default: bool,
+    correct_inflation: bool,
+):
+    if not correct_inflation:
+        return mean_dv
+    if not dv_default:
+        raise ValueError(
+            "correct_inflation is only implemented for dv_default=True "
+            "(the magnitude statistic dv_M). Arnold & Goodwin do not apply "
+            "this correction to the directional statistic dv_D."
+        )
+    if not error_flag:
+        raise ValueError("correct_inflation requires velocity uncertainties")
+
+    uncertainty = correct_dv.uniform_uncertainty(verr)
+    return correct_dv.correct(n_stars, v, uncertainty, mean_dv)
 
 
 def analyze(
@@ -52,6 +85,12 @@ def analyze(
     if error_flag is None:
         error_flag = _has_velocity_errors(verr)
 
+    if correct_inflation and not dv_default:
+        raise ValueError(
+            "correct_inflation is only implemented for dv_default=True "
+            "(the magnitude statistic dv_M)."
+        )
+
     result = calc_drdv_and_sort.calc_drdv_and_sort(
         n_stars,
         r,
@@ -64,11 +103,13 @@ def analyze(
     )
     n_bins, edges, mean_dv, error, n_in_bins, count_stars_bins = result
 
-    if error_flag and correct_inflation:
-        first_uncertainty = np.asarray(verr, dtype=float).reshape(-1)[0]
-        mean_dv = correct_dv.correct(n_stars, v, first_uncertainty, mean_dv)
+    mean_dv = _apply_inflation_correction(
+        n_stars, v, verr, mean_dv, error_flag, dv_default, correct_inflation
+    )
 
-    return VSATResult(n_bins, edges, mean_dv, error, n_in_bins, count_stars_bins)
+    return VSATResult(
+        n_bins, edges, mean_dv, error, n_in_bins, count_stars_bins, bin_width
+    )
 
 
 def _split_columns(value):
@@ -120,6 +161,7 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    dv_default = not args.radial_dv
 
     if args.demo:
         n_stars, r, v, verr = read_data.test_2(seed=42)
@@ -130,11 +172,29 @@ def main(argv=None):
             v,
             verr,
             error_flag,
-            not args.radial_dv,
+            dv_default,
             args.bin_width,
             min_tail_pairs=args.min_tail_pairs,
         )
-        vsat_result = VSATResult(*result)
+        n_bins, edges, mean_dv, error, n_in_bins, count_stars_bins = result
+        mean_dv = _apply_inflation_correction(
+            n_stars,
+            v,
+            verr,
+            mean_dv,
+            error_flag,
+            dv_default,
+            args.correct_inflation,
+        )
+        vsat_result = VSATResult(
+            n_bins,
+            edges,
+            mean_dv,
+            error,
+            n_in_bins,
+            count_stars_bins,
+            args.bin_width,
+        )
     else:
         data = args.data or parameters.DEFAULTS.path_to_data
         if not data:
@@ -145,7 +205,7 @@ def main(argv=None):
             velocity_cols=_split_columns(args.velocity_cols),
             velocity_error_cols=_split_columns(args.velocity_error_cols),
             error_flag=args.error_flag,
-            dv_default=not args.radial_dv,
+            dv_default=dv_default,
             correct_inflation=args.correct_inflation,
             bin_width=args.bin_width,
             min_tail_pairs=args.min_tail_pairs,
@@ -160,7 +220,11 @@ def main(argv=None):
     plt = plotting._pyplot()
     _, axes = plt.subplots(1, 2, figsize=(12, 5))
     plotting.v_struct_plot(
-        vsat_result.edges, vsat_result.mean_dv, vsat_result.error, ax=axes[0]
+        vsat_result.edges,
+        vsat_result.mean_dv,
+        vsat_result.error,
+        ax=axes[0],
+        bin_width=vsat_result.bin_width,
     )
     if args.demo:
         plot_r = r
